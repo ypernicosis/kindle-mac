@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+"""Ferramentas do Kindle (jailbreak + KOReader) para o Mac.
+
+  kindle-enviar LIVRO...      manda livros para /mnt/us/documents/Livros
+  kindle-trechos              grifos e notas do KOReader -> notas de livro do Ateliet
+  kindle-tela                 transmite a tela do Kindle para o OBS (fonte "Navegador")
+  kindle-servir               atende os botões do plugin "Kindle ↔ Mac" do KOReader
+
+Também funciona como `kindle enviar|trechos|tela ...`.
+O endereço do Kindle vem de $KINDLE_HOST ou ~/.config/kindle/host.
+A senha do SSH é pedida uma vez por uso; com uma chave SSH instalada, nem isso.
+"""
+import argparse
+import datetime
+import gzip
+import hashlib
+import http.server
+import json
+import os
+import re
+import shlex
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from pathlib import Path
+
+DEFAULT_HOST = "kindle"  # override with $KINDLE_HOST or ~/.config/kindle/host
+BOOK_DIR = "/mnt/us/documents/Livros"
+BOOK_EXT = {".epub", ".pdf", ".mobi", ".azw3", ".fb2", ".djvu", ".cbz", ".cbr", ".cb7", ".txt", ".html", ".docx", ".rtf", ".md"}
+
+
+# ---------------------------------------------------------------- SSH
+
+def host():
+    h = os.environ.get("KINDLE_HOST")
+    if not h:
+        f = Path.home() / ".config/kindle/host"
+        h = f.read_text().strip() if f.exists() else DEFAULT_HOST
+    return h
+
+
+def ssh_cmd(remote, *, batch=False):
+    # One master connection per run: the password (if any) is asked once.
+    cp = f"/tmp/kindle-ssh-{os.getuid()}-%C"
+    opts = ["-o", "ControlMaster=auto", "-o", f"ControlPath={cp}", "-o", "ControlPersist=120",
+            "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=10"]
+    if batch:
+        opts += ["-o", "BatchMode=yes"]
+    return ["ssh", *opts, f"root@{host()}", remote]
+
+
+def ssh(remote, *, input=None, check=True):
+    r = subprocess.run(ssh_cmd(remote), input=input, capture_output=True)
+    if check and r.returncode != 0:
+        msg = r.stderr.decode(errors="replace").strip()
+        if "timed out" in msg or "No route" in msg or "Host is down" in msg:
+            msg += "\n  O Kindle está acordado e no Wi-Fi? (o Wi-Fi desliga quando ele dorme)"
+        sys.exit(f"erro no Kindle: {msg}")
+    return r.stdout
+
+
+# ---------------------------------------------------------------- enviar
+
+def cmd_enviar(args):
+    files = [Path(f) for f in args.livros]
+    for f in files:
+        if not f.is_file():
+            sys.exit(f"não achei: {f}")
+        if f.suffix.lower() not in BOOK_EXT and not args.forcar:
+            sys.exit(f"{f.name}: formato que o KOReader não abre (use --forcar para mandar mesmo assim)")
+    if args.fila or subprocess.run(ssh_cmd("true"), capture_output=True).returncode != 0:
+        # Kindle asleep or away: the files wait in the queue for the "Receber livros" button
+        QUEUE.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            (QUEUE / f.name).write_bytes(f.read_bytes())
+            print(f"→ na fila: {f.name}")
+        print(f"O Kindle não respondeu: {len(files)} livro(s) em {QUEUE}.\n"
+              "No KOReader: menu 🔧 → Kindle ↔ Mac → Receber livros do Mac.")
+        return
+    dest = BOOK_DIR if not args.pasta else f"{BOOK_DIR}/{args.pasta.strip('/')}"
+    ssh(f"mkdir -p {shlex.quote(dest)}")
+    for f in files:
+        target = f"{dest}/{f.name}"
+        size = f.stat().st_size
+        print(f"→ {f.name} ({size / 1048576:.1f} MB)", flush=True)
+        ssh(f"cat > {shlex.quote(target + '.part')} && mv {shlex.quote(target + '.part')} {shlex.quote(target)}",
+            input=f.read_bytes())
+    ssh("sync")
+    print(f"pronto: {len(files)} livro(s) em {dest}")
+
+
+# ---------------------------------------------------------------- Lua (metadata.*.lua do KOReader)
+
+class Lua:
+    """Reads the tables KOReader writes (frontend/dump.lua)."""
+
+    def __init__(self, s):
+        self.s, self.i = s, 0
+
+    def ws(self):
+        s, n = self.s, len(self.s)
+        while self.i < n:
+            c = s[self.i]
+            if c in " \t\r\n,;":
+                self.i += 1
+            elif s.startswith("--", self.i):
+                j = s.find("\n", self.i)
+                self.i = n if j < 0 else j + 1
+            else:
+                break
+
+    def value(self):
+        self.ws()
+        s, c = self.s, self.s[self.i]
+        if c == "{":
+            return self.table()
+        if c in "\"'":
+            return self.string()
+        for word, v in (("true", True), ("false", False), ("nil", None)):
+            if s.startswith(word, self.i):
+                self.i += len(word)
+                return v
+        m = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?|inf|nan)").match(s, self.i)
+        if not m:
+            raise ValueError(f"lua: inesperado em {self.i}: {s[self.i:self.i + 20]!r}")
+        self.i = m.end()
+        t = m.group()
+        if "x" in t:
+            return int(t, 16)
+        return float(t) if any(ch in t for ch in ".eEn") else int(t)
+
+    def string(self):
+        q, s = self.s[self.i], self.s
+        self.i += 1
+        out = []
+        while True:
+            c = s[self.i]
+            if c == q:
+                self.i += 1
+                # the text is read byte for byte (latin-1); strings are UTF-8
+                return "".join(out).encode("latin-1", "replace").decode("utf-8", "replace")
+            if c == "\\":
+                self.i += 1
+                e = s[self.i]
+                if e.isdigit():
+                    m = re.compile(r"\d{1,3}").match(s, self.i)
+                    out.append(chr(int(m.group())))
+                    self.i = m.end()
+                    continue
+                out.append({"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v", "\n": "\n"}.get(e, e))
+                self.i += 1
+                continue
+            out.append(c)
+            self.i += 1
+
+    def table(self):
+        self.i += 1
+        d, arr = {}, []
+        while True:
+            self.ws()
+            if self.s[self.i] == "}":
+                self.i += 1
+                break
+            if self.s[self.i] == "[":
+                self.i += 1
+                k = self.value()
+                self.ws()
+                assert self.s[self.i] == "]"
+                self.i += 1
+                self.ws()
+                assert self.s[self.i] == "="
+                self.i += 1
+                d[k] = self.value()
+            else:
+                m = re.compile(r"([A-Za-z_]\w*)\s*=").match(self.s, self.i)
+                if m:
+                    self.i = m.end()
+                    d[m.group(1)] = self.value()
+                else:
+                    arr.append(self.value())
+        for n, v in enumerate(arr, 1):
+            d[n] = v
+        if d and all(isinstance(k, int) for k in d) and sorted(d) == list(range(1, len(d) + 1)):
+            return [d[k] for k in sorted(d)]
+        return d
+
+    @classmethod
+    def load(cls, text):
+        p = cls(text)
+        p.ws()
+        if p.s.startswith("return", p.i):
+            p.i += len("return")
+        return p.value()
+
+
+# ---------------------------------------------------------------- trechos -> Ateliet
+
+COLORS = {"yellow": "amarelo", "orange": "amarelo", "gray": "amarelo", "red": "rosa", "purple": "rosa",
+          "green": "verde", "olive": "verde", "cyan": "azul", "blue": "azul"}
+ATELIET_READS = {".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt"}
+OPEN = "%% ateliet:leitor"
+
+
+def ateliet_vault():
+    f = Path.home() / "Library/Application Support/ateliet/ateliet.json"
+    try:
+        return Path(json.loads(f.read_text())["last"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def clean_name(s):
+    # as core/src/reader/marks.rs clean_name
+    c = "".join(ch for ch in s if ch not in '/\\:*?"<>|#^[]\n\r').strip()[:90].strip().rstrip(".")
+    return c or "Livro"
+
+
+def yaml_str(v):
+    if re.fullmatch(r"[\wÀ-ɏ][\wÀ-ɏ .,()'’-]*", v) and not v.endswith(" ") and ": " not in v:
+        return v
+    return "'" + v.replace("'", "''") + "'"
+
+
+METADATA_SCRIPT = (
+    'find /mnt/us -path /mnt/us/koreader/data -prune -o -path "*.sdr/metadata.*.lua" -print 2>/dev/null'
+    ' | while IFS= read -r f; do printf "\\n@@KINDLE-FILE@@ %s\\n" "$f"; cat "$f"; done'
+)
+
+
+def fetch_metadata():
+    """{path on the Kindle: metadata table} for every book with annotations."""
+    return parse_metadata(ssh(METADATA_SCRIPT))
+
+
+def parse_metadata(raw):
+    """The metadata files, as METADATA_SCRIPT prints them."""
+    raw = raw.decode("latin-1")
+    out = {}
+    for chunk in raw.split("\n@@KINDLE-FILE@@ ")[1:]:
+        path, _, body = chunk.partition("\n")
+        path = path.encode("latin-1").decode("utf-8", "replace")
+        try:
+            t = Lua.load(body)
+        except (ValueError, IndexError, AssertionError) as e:
+            print(f"  aviso: não li {path}: {e}", file=sys.stderr)
+            continue
+        if isinstance(t, dict):
+            out[path] = t
+    return out
+
+
+def annotations(meta):
+    """KOReader's highlights and notes, new format (annotations) or old (highlight)."""
+    anns = meta.get("annotations")
+    if isinstance(anns, list):
+        return [a for a in anns if isinstance(a, dict) and a.get("text") and a.get("pos0") is not None]
+    out = []
+    for page, items in (meta.get("highlight") or {}).items():
+        for h in (items.values() if isinstance(items, dict) else items or []):
+            if isinstance(h, dict) and h.get("text"):
+                h = dict(h)
+                h.setdefault("pageno", page if isinstance(page, int) else None)
+                out.append(h)
+    return out
+
+
+def book_path_on_kindle(sdr_meta_path, meta):
+    p = meta.get("doc_path")
+    if p:
+        return p
+    d = sdr_meta_path.rsplit("/", 1)[0]
+    ext = sdr_meta_path.rsplit("metadata.", 1)[1][:-4]
+    return d[:-4] + "." + ext
+
+
+def mark_id(a):
+    h = hashlib.sha1(f"{a.get('datetime', '')}|{a.get('text', '')}".encode()).hexdigest()
+    return "g-k" + h[:6]
+
+
+def callout(color, label, text, note, mid):
+    s = f"> [!grifo|{color}] {label}".rstrip() + "\n"
+    for l in text.splitlines() or [""]:
+        s += f"> {l}\n"
+    if note.strip():
+        s += ">\n"
+        for i, l in enumerate(note.strip().splitlines()):
+            s += ("> Nota: " if i == 0 else "> ") + l + "\n"
+    return s + f"\n^{mid}\n"
+
+
+def find_book_note(vault, rel_file, title):
+    folder = vault / "Livros"
+    if not folder.is_dir():
+        return None
+    base = rel_file.rsplit("/", 1)[-1] if rel_file else None
+    cands = sorted(folder.rglob("*.md"), key=lambda p: p.name != f"{clean_name(title)}.md")
+    for p in cands:
+        try:
+            t = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        m = re.match(r"﻿?---\n(.*?)\n---", t, re.S)
+        if not m or not re.search(r"^leitor:\s*livro\s*$", m.group(1), re.M):
+            continue
+        a = re.search(r"^arquivo:\s*(.+)$", m.group(1), re.M)
+        if a and rel_file:
+            v = a.group(1).strip().strip("'\"").replace("''", "'")
+            v = v.removeprefix("[[").removesuffix("]]").split("|")[0]
+            if v == rel_file or ("/" not in v and v == base):
+                return p
+        elif not rel_file and p.name == f"{clean_name(title)}.md":
+            return p
+    return None
+
+
+def locate_in_vault(vault, name):
+    for p in vault.rglob(name):
+        if ".obsidian" not in p.parts and p.is_file():
+            return p
+    return None
+
+
+def trechos_state(vault):
+    try:
+        return json.loads((vault / ".obsidian/ateliet/kindle-trechos.json").read_text())
+    except (OSError, ValueError):
+        return {"exportados": []}
+
+
+def books_with_new_marks(metas, vault):
+    """(path on the Kindle, meta, new annotations) of each book with something to export."""
+    done = set(trechos_state(vault)["exportados"])
+    for mpath, meta in sorted(metas.items()):
+        fresh = [a for a in annotations(meta) if mark_id(a) not in done]
+        if fresh:
+            yield book_path_on_kindle(mpath, meta), meta, fresh
+
+
+def books_needed(metas, vault):
+    """Books with new highlights that the Ateliet can open but the vault doesn't have."""
+    out = []
+    for kpath, _, _ in books_with_new_marks(metas, vault):
+        fname = kpath.rsplit("/", 1)[-1]
+        if "." + fname.rsplit(".", 1)[-1].lower() in ATELIET_READS and not locate_in_vault(vault, fname):
+            out.append(kpath)
+    return out
+
+
+def cmd_trechos(args):
+    vault = Path(args.vault).expanduser() if args.vault else ateliet_vault()
+    if not vault or not vault.is_dir():
+        sys.exit("não achei o vault do Ateliet; use --vault CAMINHO")
+    print(f"lendo os grifos do Kindle ({host()})…", flush=True)
+    metas = fetch_metadata()
+    get_book = None if args.sem_livro else (lambda kpath: ssh(f"cat {shlex.quote(kpath)}"))
+    total = export_trechos(vault, metas, get_book, teste=args.teste, log=print)
+    print(f"pronto: {total} grifo(s) novo(s)" if total else "nada novo para exportar")
+
+
+def export_trechos(vault, metas, get_book, teste=False, log=print):
+    """Writes the new highlights into the book notes; returns how many.
+    get_book(path on the Kindle) gives a book's bytes (None: don't copy books)."""
+    state = trechos_state(vault)
+    done = set(state["exportados"])
+    total_new = 0
+    for kpath, meta, fresh in books_with_new_marks(metas, vault):
+        props = meta.get("doc_props") or {}
+        fname = kpath.rsplit("/", 1)[-1]
+        title = (props.get("title") or "").strip() or fname.rsplit(".", 1)[0]
+        author = (props.get("authors") or "").replace("\n", ", ").strip()
+        ext = "." + fname.rsplit(".", 1)[-1].lower()
+
+        # the book file in the vault, so "Abrir no Leitor" works
+        rel_file = ""
+        if ext in ATELIET_READS:
+            found = locate_in_vault(vault, fname)
+            data = get_book(kpath) if not found and get_book and not teste else None
+            if data:
+                dest = vault / "Livros/Arquivos" / fname
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                log(f"  livro copiado para o vault: {dest.relative_to(vault)}")
+                dest.write_bytes(data)
+                found = dest
+            if found:
+                rel_file = found.relative_to(vault).as_posix()
+
+        note = find_book_note(vault, rel_file, title)
+        if note is None:
+            note = vault / "Livros" / f"{clean_name(title)}.md"
+            n = 2
+            while note.exists():
+                note = vault / "Livros" / f"{clean_name(title)} ({n}).md"
+                n += 1
+            fm = ["---", "leitor: livro", f"titulo: {yaml_str(title)}"]
+            if author:
+                fm.append(f"autor: {yaml_str(author)}")
+            if rel_file:
+                fm.append(f"arquivo: '[[{rel_file.replace(chr(39), chr(39) * 2)}]]'")
+            fm.append(f"criado: {datetime.date.today().isoformat()}")
+            fm.append("---")
+            body = f"\n# {title}\n\n" + (f"[[{rel_file}|Abrir no Leitor]]\n\n" if rel_file else "")
+            text = "\n".join(fm) + "\n" + body
+        else:
+            text = note.read_text(encoding="utf-8")
+
+        # split off the data block
+        data = {"v": 1, "marks": {}}
+        a = text.find(OPEN)
+        if a >= 0:
+            e = text.find("%%", a + len(OPEN))
+            try:
+                data = json.loads(text[a + len(OPEN):e].strip() or "{}")
+            except ValueError:
+                pass
+            data.setdefault("marks", {})
+            end = e + 2 + (1 if text[e + 2:e + 3] == "\n" else 0)
+            text = text[:a] + text[end:]
+        text = text.rstrip("\n") + "\n\n"
+
+        for ann in sorted(fresh, key=lambda x: (x.get("pageno") or 0, x.get("datetime") or "")):
+            mid = mark_id(ann)
+            color = COLORS.get((ann.get("color") or "").lower(), "amarelo")
+            pageno = ann.get("pageno") or (ann.get("page") if isinstance(ann.get("page"), int) else None)
+            chap_title = (ann.get("chapter") or "").strip()
+            label = " · ".join(x for x in (chap_title, f"p. {pageno}" if pageno else "") if x)
+            txt = ann["text"].strip()
+            note_txt = (ann.get("note") or "").strip()
+            loc = {"arquivo": rel_file, "citacao": {"exato": " ".join(txt.split())[:300]}}
+            m = re.search(r"DocFragment\[(\d+)\]", str(ann.get("page") or ann.get("pos0") or ""))
+            if m:
+                loc["capitulo"] = int(m.group(1)) - 1
+            elif isinstance(ann.get("page"), int) and ext in (".pdf", ".cbz", ".cbr", ".cb7", ".cbt"):
+                loc["pagina"] = ann["page"]
+            created = (ann.get("datetime") or "").replace(" ", "T")[:16]
+            text += callout(color, label, txt, note_txt, mid) + "\n"
+            data["marks"][mid] = {"local": loc, "fim": 0, "cor": color, "nota": note_txt,
+                                  "criado": created, "texto": txt, "rotulo": label}
+            done.add(mid)
+
+        text += OPEN + "\n" + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n%%\n"
+        if teste:
+            log(f"  [teste] {note.relative_to(vault)}: +{len(fresh)}")
+        else:
+            note.parent.mkdir(parents=True, exist_ok=True)
+            tmp = note.with_suffix(".md.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(note)
+            log(f"  {note.relative_to(vault)}: +{len(fresh)} grifo(s)")
+        total_new += len(fresh)
+
+    if not teste and total_new:
+        state["exportados"] = sorted(done)
+        state["ultimo"] = datetime.datetime.now().isoformat(timespec="seconds")
+        state_f = vault / ".obsidian/ateliet/kindle-trechos.json"
+        state_f.parent.mkdir(parents=True, exist_ok=True)
+        state_f.write_text(json.dumps(state, ensure_ascii=False, indent=1))
+    return total_new
+
+
+# ---------------------------------------------------------------- tela -> OBS
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Kindle</title>
+<style>
+html,body{margin:0;height:100%;background:#BG;overflow:hidden}
+#w{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+img{max-width:100%;max-height:100%;object-fit:contain;FILTER}
+#w.r90 img,#w.r270 img{max-width:100vh;max-height:100vw}
+#w.r90 img{transform:rotate(90deg)} #w.r180 img{transform:rotate(180deg)} #w.r270 img{transform:rotate(270deg)}
+#s{position:fixed;left:8px;bottom:6px;font:12px system-ui;color:#888;display:none}
+</style></head><body><div id="w" class="rROT"><img id="i" alt=""></div><div id="s">Kindle sem sinal…</div>
+<script>
+let id=0;const img=document.getElementById('i'),st=document.getElementById('s');
+async function loop(){
+  for(;;){
+    try{
+      const r=await fetch('/frame.png?after='+id,{cache:'no-store'});
+      if(r.status===200){
+        id=+r.headers.get('X-Frame');
+        const u=URL.createObjectURL(await r.blob());
+        const old=img.src; img.src=u; if(old.startsWith('blob:'))setTimeout(()=>URL.revokeObjectURL(old),1000);
+      }
+      st.style.display=r.headers.get('X-Live')==='0'?'block':'none';
+    }catch(e){st.style.display='block';await new Promise(r=>setTimeout(r,1000));}
+  }
+}
+loop();
+</script></body></html>"""
+
+# On the Kindle: one gzip member per frame, from the buffer on screen.
+REMOTE_GRAB = r"""
+F=/sys/class/graphics/fb0
+S=$(cat $F/stride); W=${S}; H=$(cut -d, -f2 $F/virtual_size); B=$(cat $F/bits_per_pixel)
+X=$(cut -d, -f1 $F/virtual_size)
+V=$(cat $F/modes | sed -n 's/.*:\([0-9]*\)x\([0-9]*\).*/\2/p'); [ -n "$V" ] && H=$V
+echo "KINDLE-FB $X $H $S $B"
+while :; do
+  off=$(cut -d, -f2 $F/pan)
+  dd if=/dev/fb0 bs=$S skip=$off count=$H 2>/dev/null | gzip -1
+  usleep DELAY 2>/dev/null || sleep 1
+done
+"""
+
+
+def png_gray(w, h, raw):
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    rows = b"".join(b"\0" + raw[y * w:(y + 1) * w] for y in range(h))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 1)) + chunk(b"IEND", b""))
+
+
+class Screen:
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.png = None
+        self.id = 0
+        self.live = False
+        self.digest = None
+
+    def put(self, w, h, stride, raw):
+        d = hashlib.blake2b(raw, digest_size=16).digest()
+        with self.cv:
+            self.live = True
+            if d == self.digest:
+                return
+        if stride != w:
+            raw = b"".join(raw[y * stride:y * stride + w] for y in range(h))
+        png = png_gray(w, h, raw)
+        with self.cv:
+            self.digest, self.png, self.id = d, png, self.id + 1
+            self.cv.notify_all()
+
+    def offline(self):
+        with self.cv:
+            self.live = False
+            self.cv.notify_all()
+
+
+def feed_stream(screen, stream, head):
+    """Reads frames (one gzip member each, after a "KINDLE-FB w h stride bpp" line) into screen."""
+    w, h, stride, bpp = map(int, head[-4:])
+    if bpp != 8:
+        raise OSError(f"tela de {bpp} bits não suportada")
+    print(f"Kindle conectado: tela {w}x{h}", flush=True)
+    size = stride * h
+    buf = bytearray()
+    dec = zlib.decompressobj(31)
+    while True:
+        chunk = stream.read1(65536) if hasattr(stream, "read1") else stream.read(65536)
+        if not chunk:
+            return
+        while chunk:
+            buf += dec.decompress(chunk)
+            if dec.eof:
+                chunk = dec.unused_data
+                dec = zlib.decompressobj(31)
+            else:
+                chunk = b""
+        while len(buf) >= size:
+            frame = bytes(buf[:size])
+            del buf[:size]
+            screen.put(w, h, stride, frame)
+
+
+def grab_loop(screen, fps):
+    delay = max(50_000, int(1_000_000 / fps))
+    while True:
+        p = subprocess.Popen(ssh_cmd(REMOTE_GRAB.replace("DELAY", str(delay))), stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        try:
+            head = p.stdout.readline().decode().split()
+            if len(head) != 5 or head[0] != "KINDLE-FB":
+                raise OSError("sem resposta")
+            feed_stream(screen, p.stdout, head)
+        except OSError as e:
+            print(f"Kindle: {e}", flush=True)
+        finally:
+            p.kill()
+        screen.offline()
+        print("sem sinal do Kindle; tentando de novo em 3 s…", flush=True)
+        time.sleep(3)
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def obs_server(screen, port, girar=0, inverter=False, fundo="#000000"):
+    """The page for OBS's browser source, on this Mac only."""
+    page = (PAGE.replace("BG", fundo.lstrip("#")).replace("ROT", str(girar))
+            .replace("FILTER", "filter:invert(1)" if inverter else ""))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/frame.png"):
+                m = re.search(r"after=(\d+)", self.path)
+                after = int(m.group(1)) if m else -1
+                with screen.cv:
+                    screen.cv.wait_for(lambda: screen.id != after, timeout=10)
+                    png, fid, live = screen.png, screen.id, screen.live
+                if png is None or fid == after:
+                    self.send_response(204)
+                    self.send_header("X-Live", "1" if live else "0")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Frame", str(fid))
+                self.send_header("X-Live", "1" if live else "0")
+                self.send_header("Content-Length", str(len(png)))
+                self.end_headers()
+                self.wfile.write(png)
+            elif self.path.split("?")[0] in ("/", "/index.html"):
+                b = page.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+            else:
+                self.send_error(404)
+
+    return Server(("127.0.0.1", port), H)
+
+
+def obs_help(url, girar):
+    w, h = (1448, 1072) if girar in (90, 270) else (1072, 1448)
+    return f"""No OBS: Fontes → + → Navegador
+  URL:     {url}
+  Largura: {w}   Altura: {h}
+  (desmarque "Desligar fonte quando não visível")"""
+
+
+def cmd_tela(args):
+    screen = Screen()
+    srv = obs_server(screen, args.porta, args.girar, args.inverter, args.fundo)
+    # connect once in the foreground, so the SSH password prompt (if any) shows here
+    subprocess.run(ssh_cmd("true"), check=False)
+    threading.Thread(target=grab_loop, args=(screen, args.fps), daemon=True).start()
+    url = f"http://127.0.0.1:{args.porta}/"
+    print(f"\nTransmitindo a tela do Kindle em {url}\n\n{obs_help(url, args.girar)}\n\nCtrl+C para parar.", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nparado.")
+
+
+# ---------------------------------------------------------------- servir (os botões do KOReader)
+
+CONFIG = Path.home() / ".config/kindle/servidor.json"
+QUEUE = Path.home() / "Kindle/Enviar"
+SENT = Path.home() / "Kindle/Enviados"
+
+
+def server_config():
+    try:
+        c = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        c = {}
+    if not c.get("token"):
+        c["token"] = hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG.write_text(json.dumps(c, indent=1))
+        CONFIG.chmod(0o600)
+    c.setdefault("porta", 8766)
+    c.setdefault("porta_tela", 8767)
+    c.setdefault("porta_obs", 8765)
+    return c
+
+
+def queue_files():
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    return sorted(p for p in QUEUE.iterdir()
+                  if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in BOOK_EXT)
+
+
+def cmd_servir(args):
+    conf = server_config()
+    token = conf["token"]
+    screen = Screen()
+    pending = {"metas": None, "books": {}}
+    lock = threading.Lock()
+
+    def log(*a):
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, code, body=b"", ctype="text/plain; charset=utf-8"):
+            if isinstance(body, str):
+                body = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def authorized(self):
+            if self.headers.get("X-Token") == token:
+                return True
+            self.reply(403, "token errado\n")
+            return False
+
+        def body(self):
+            return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+        def name_arg(self):
+            m = re.search(r"[?&]n=([0-9a-f]+)", self.path)
+            name = bytes.fromhex(m.group(1)).decode() if m else ""
+            p = QUEUE / name
+            return p if name and "/" not in name and p.is_file() else None
+
+        def do_GET(self):
+            if not self.authorized():
+                return
+            path = self.path.split("?")[0]
+            if path == "/ping":
+                self.reply(200, f"ok {os.uname().nodename}\n")
+            elif path == "/fila":
+                lines = [f"{p.name.encode().hex()}\t{p.stat().st_size}\t{p.name}" for p in queue_files()]
+                self.reply(200, "".join(l + "\n" for l in lines))
+            elif path == "/fila/arquivo":
+                p = self.name_arg()
+                if not p:
+                    return self.reply(404, "não está na fila\n")
+                self.reply(200, p.read_bytes(), "application/octet-stream")
+            else:
+                self.reply(404, "?\n")
+
+        def do_POST(self):
+            if not self.authorized():
+                return
+            path = self.path.split("?")[0]
+            vault = ateliet_vault()
+            if path == "/fila/feito":
+                p = self.name_arg()
+                if p:
+                    SENT.mkdir(parents=True, exist_ok=True)
+                    p.replace(SENT / p.name)
+                    log("entregue ao Kindle:", p.name)
+                self.reply(200, "ok\n")
+            elif path == "/trechos/precisa":
+                if not vault:
+                    return self.reply(500, "não achei o vault do Ateliet no Mac\n")
+                with lock:
+                    pending["metas"] = parse_metadata(self.body())
+                    pending["books"] = {}
+                    need = books_needed(pending["metas"], vault)
+                self.reply(200, "".join(p + "\n" for p in need))
+            elif path == "/trechos/livro":
+                kpath = bytes.fromhex(self.headers.get("X-Caminho", "")).decode()
+                with lock:
+                    pending["books"][kpath] = self.body()
+                self.reply(200, "ok\n")
+            elif path == "/trechos/exportar":
+                with lock:
+                    metas, books = pending["metas"], pending["books"]
+                    pending["metas"], pending["books"] = None, {}
+                if metas is None or not vault:
+                    return self.reply(400, "mande /trechos/precisa antes\n")
+                out = []
+                n = export_trechos(vault, metas, books.get, log=out.append)
+                for l in out:
+                    log(l.strip())
+                msg = f"{n} grifo(s) novo(s) no Ateliet" if n else "Nada novo para exportar."
+                log("trechos:", msg)
+                self.reply(200, msg + "\n" + "\n".join(l.strip() for l in out) + "\n")
+            else:
+                self.reply(404, "?\n")
+
+    class Frames(socketserver.StreamRequestHandler):
+        def handle(self):
+            head = self.rfile.readline().decode(errors="replace").split()
+            if len(head) != 6 or head[0] != "KINDLE-FB" or head[1] != token:
+                return
+            try:
+                feed_stream(screen, self.rfile, head)
+            except (OSError, ValueError, zlib.error) as e:
+                log("tela:", e)
+            finally:
+                screen.offline()
+                log("transmissão da tela encerrada")
+
+    class TCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    api = Server(("0.0.0.0", conf["porta"]), H)
+    frames = TCP(("0.0.0.0", conf["porta_tela"]), Frames)
+    servers = [frames]
+    try:
+        servers.append(obs_server(screen, conf["porta_obs"]))
+        log(f"tela para o OBS em http://127.0.0.1:{conf['porta_obs']}/")
+    except OSError:
+        log(f"porta {conf['porta_obs']} ocupada (um kindle-tela aberto?): a página do OBS fica com ele")
+    for s in servers:
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    log(f"servindo os botões do KOReader na porta {conf['porta']}; fila de livros: {QUEUE}")
+    try:
+        api.serve_forever()
+    except KeyboardInterrupt:
+        print("\nparado.")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    prog = Path(sys.argv[0]).name
+    argv = sys.argv[1:]
+    sub = {"kindle-enviar": "enviar", "kindle-trechos": "trechos", "kindle-tela": "tela", "kindle-servir": "servir"}.get(prog)
+    if sub:
+        argv = [sub, *argv]
+
+    p = argparse.ArgumentParser(prog="kindle", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    s = p.add_subparsers(dest="cmd", required=True)
+
+    e = s.add_parser("enviar", help="manda livros para o Kindle (pasta Livros)")
+    e.add_argument("livros", nargs="+")
+    e.add_argument("--pasta", help="subpasta dentro de Livros (ex.: Quadrinhos)")
+    e.add_argument("--forcar", action="store_true", help="manda mesmo formatos desconhecidos")
+    e.add_argument("--fila", action="store_true", help="só põe na fila (~/Kindle/Enviar) para o botão do KOReader")
+    e.set_defaults(fn=cmd_enviar)
+
+    t = s.add_parser("trechos", help="grifos do KOReader -> notas de livro do Ateliet")
+    t.add_argument("--vault", help="vault (padrão: o último aberto no Ateliet)")
+    t.add_argument("--sem-livro", action="store_true", help="não copia o arquivo do livro para o vault")
+    t.add_argument("--teste", action="store_true", help="mostra o que faria, sem gravar")
+    t.set_defaults(fn=cmd_trechos)
+
+    v = s.add_parser("tela", help="transmite a tela do Kindle para o OBS")
+    v.add_argument("--porta", type=int, default=8765)
+    v.add_argument("--fps", type=float, default=3, help="quadros por segundo (padrão 3; e-ink não precisa de mais)")
+    v.add_argument("--girar", type=int, choices=(0, 90, 180, 270), default=0, help="para ler deitado")
+    v.add_argument("--inverter", action="store_true", help="inverte as cores (modo noturno)")
+    v.add_argument("--fundo", default="#000000", help="cor em volta da página")
+    v.set_defaults(fn=cmd_tela)
+
+    sv = s.add_parser("servir", help="atende os botões do plugin do KOReader (rode sempre ligado)")
+    sv.set_defaults(fn=cmd_servir)
+
+    a = p.parse_args(argv)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
